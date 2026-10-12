@@ -1,0 +1,23 @@
+services:
+  vault:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - ./server.env
+    environment:
+      VAULT_DATA_DIR: /data
+      HOST: 0.0.0.0
+      PORT: "8787"
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - vault-data:/data
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    stop_grace_period: 15s
+
+volumes:
+  vault-data:

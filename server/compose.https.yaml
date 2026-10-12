@@ -1,0 +1,35 @@
+services:
+  vault:
+    build: .
+    restart: unless-stopped
+    env_file: ./server.env
+    environment:
+      VAULT_DATA_DIR: /data
+      HOST: 0.0.0.0
+      PORT: "8787"
+    volumes:
+      - vault-data:/data
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    stop_grace_period: 15s
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    environment:
+      VAULT_DOMAIN: ${VAULT_DOMAIN:?Set VAULT_DOMAIN to your public DNS name}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on: [vault]
+    security_opt:
+      - no-new-privileges:true
+volumes:
+  vault-data:
+  caddy-data:
+  caddy-config:
