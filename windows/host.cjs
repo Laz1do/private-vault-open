@@ -113,7 +113,7 @@ function createHost({ config, dataDir, clipboard, shell, safeStorage, dialog, ge
   if (typeof dataDir !== 'string' || !dataDir.length) throw new Error('本地存储目录无效');
   const dataFile = path.join(dataDir, 'vault.json');
   const stateFile = path.join(dataDir, 'state.json');
-  let writes = Promise.resolve(), loading = null, blockedWrites = false, profile = suppliedConfig, local = null;
+  let writes = Promise.resolve(), loading = null, blockedWrites = false, backupActive = false, profile = suppliedConfig, local = null;
   const clone = value => value === null ? null : structuredClone(value);
   function requireProtection() {
     if (!safeStorage?.isEncryptionAvailable?.() || safeStorage.getSelectedStorageBackend?.() === 'basic_text')
@@ -157,54 +157,124 @@ function createHost({ config, dataDir, clipboard, shell, safeStorage, dialog, ge
     })();
     return loading;
   }
+  async function commitState(nextProfile, nextLocal, text) {
+    await load();
+    if (blockedWrites) throw new Error('本地库已损坏，已停止写入以防覆盖数据');
+    if (!compatibilityStorage) decryptForMigration(nextLocal.envelope, nextProfile);
+    if (local) {
+      if (!profile) {
+        if (nextProfile.vaultId !== local.envelope.vaultId) throw new Error('导入文件不属于现有密码库');
+        decryptForMigration(local.envelope, nextProfile);
+      } else if (profile.vaultId === nextProfile.vaultId) {
+        if (profile.keyB64 !== nextProfile.keyB64) throw new Error('不能替换现有密码库的密钥');
+      } else {
+        const oldVault = decryptForMigration(local.envelope, profile);
+        if (Object.keys(oldVault.records).length) throw new Error('已有记录，不能替换为另一个密码库');
+      }
+    }
+    await fs.mkdir(dataDir, { recursive: true });
+    if (compatibilityStorage) {
+      if (JSON.stringify(nextProfile) !== JSON.stringify(profile)) throw new Error('系统密钥保护不可用，不能保存更改的配置');
+      await atomicWrite(dataFile, text);
+    } else {
+      requireProtection();
+      const protectedConfig = safeStorage.encryptString(JSON.stringify(nextProfile)).toString('base64');
+      const stateText = JSON.stringify({ v: 1, protectedConfig, local: nextLocal });
+      if (Buffer.byteLength(stateText) > MAX_BYTES) throw new Error('密码库过大');
+      await atomicWrite(stateFile, stateText);
+    }
+    profile = nextProfile; local = clone(nextLocal);
+  }
   async function writeState(nextConfig, value) {
+    if (backupActive) throw new Error('正在备份并新建密码库，请等待完成');
     if (blockedWrites) throw new Error('本地库已损坏，已停止写入以防覆盖数据');
     const nextProfile = validateConfig(nextConfig);
     const text = validateLocal(value, nextProfile.vaultId);
-    await load();
     const nextLocal = JSON.parse(text);
-    if (!compatibilityStorage) decryptForMigration(nextLocal.envelope, nextProfile);
-    const job = writes.catch(() => {}).then(async () => {
-      if (blockedWrites) throw new Error('本地库已损坏，已停止写入以防覆盖数据');
-      if (local) {
-        if (!profile) {
-          if (nextProfile.vaultId !== local.envelope.vaultId) throw new Error('导入文件不属于现有密码库');
-          decryptForMigration(local.envelope, nextProfile);
-        } else if (profile.vaultId === nextProfile.vaultId) {
-          if (profile.keyB64 !== nextProfile.keyB64) throw new Error('不能替换现有密码库的密钥');
-        } else {
-          const oldVault = decryptForMigration(local.envelope, profile);
-          if (Object.keys(oldVault.records).length) throw new Error('已有记录，不能替换为另一个密码库');
-        }
-      }
-      await fs.mkdir(dataDir, { recursive: true });
-      if (compatibilityStorage) {
-        if (JSON.stringify(nextProfile) !== JSON.stringify(profile)) throw new Error('系统密钥保护不可用，不能保存更改的配置');
-        await atomicWrite(dataFile, text);
-      } else {
-        requireProtection();
-        const protectedConfig = safeStorage.encryptString(JSON.stringify(nextProfile)).toString('base64');
-        const stateText = JSON.stringify({ v: 1, protectedConfig, local: nextLocal });
-        if (Buffer.byteLength(stateText) > MAX_BYTES) throw new Error('密码库过大');
-        await atomicWrite(stateFile, stateText);
-      }
-      profile = nextProfile; local = clone(nextLocal);
-    });
+    // Reserve ordering before any await, including the initial load.
+    const job = writes.catch(() => {}).then(() => commitState(nextProfile, nextLocal, text));
     writes = job;
     return job;
+  }
+  async function chooseExportTarget(title, defaultPath) {
+    if (!dialog?.showSaveDialog) throw new Error('文件保存暂不可用');
+    const options = { title, defaultPath, filters: [{ name: '密码库文件', extensions: ['pvault', 'json'] }] };
+    const parent = getWindow();
+    const result = parent ? await dialog.showSaveDialog(parent, options) : await dialog.showSaveDialog(options);
+    if (result.canceled || !result.filePath) return null;
+    const target = path.resolve(result.filePath);
+    const canonicalDir = await fs.realpath(dataDir).catch(() => path.resolve(dataDir));
+    const targetDir = await fs.realpath(path.dirname(target));
+    const canonicalTarget = path.join(targetDir, path.basename(target));
+    const storagePrefix = canonicalDir.toLowerCase() + path.sep;
+    if (canonicalTarget.toLowerCase() === canonicalDir.toLowerCase() || canonicalTarget.toLowerCase().startsWith(storagePrefix))
+      throw new Error('不能将导出文件保存到应用内部数据目录');
+    return target;
+  }
+  async function backupAndReplace(text, nextConfig, value) {
+    if (backupActive) throw new Error('正在备份并新建密码库，请等待完成');
+    if (blockedWrites) throw new Error('本地库已损坏，已停止写入以防覆盖数据');
+    if (typeof text !== 'string' || !text.length || Buffer.byteLength(text, 'utf8') > MAX_BYTES) throw new Error('备份文件格式或大小无效');
+    const nextProfile = validateConfig(nextConfig);
+    const nextLocal = JSON.parse(validateLocal(value, nextProfile.vaultId));
+    backupActive = true;
+    const job = writes.catch(() => {}).then(async () => {
+      await load();
+      if (blockedWrites || !profile || !local) throw new Error('请先恢复并打开当前密码库，再备份新建');
+      if (compatibilityStorage) throw new Error('系统密钥保护不可用，不能备份后新建');
+      requireProtection();
+      const { parsePortableFile, decryptVault, mergeVaults } = await import('../core/vault.js');
+      const backup = parsePortableFile(text);
+      const { mode: _, ...oldProfile } = profile;
+      if (JSON.stringify(backup.profile) !== JSON.stringify(oldProfile)) throw new Error('备份文件必须使用当前密码库的完整配置');
+      const oldVault = await decryptVault(local.envelope, profile.keyB64, profile.vaultId);
+      if (JSON.stringify(mergeVaults(oldVault, backup.vault)) !== JSON.stringify(backup.vault))
+        throw new Error('备份文件遗漏当前密码库的记录、冲突或删除历史');
+      if (nextProfile.vaultId === profile.vaultId || nextProfile.keyB64 === profile.keyB64 || nextProfile.token === profile.token
+        || nextProfile.mode !== 'file' || nextProfile.endpoint !== null || nextLocal.deviceId !== local.deviceId)
+        throw new Error('新密码库必须使用独立的标识、密钥和凭据，并从文件模式开始');
+      const nextVault = await decryptVault(nextLocal.envelope, nextProfile.keyB64, nextProfile.vaultId);
+      if (Object.keys(nextVault.records).length) throw new Error('新密码库必须为空');
+      // Prepare protected state before asking for the backup location. Neither a
+      // protection failure nor a canceled dialog may replace the old library.
+      const protectedConfig = safeStorage.encryptString(JSON.stringify(nextProfile)).toString('base64');
+      const stateText = JSON.stringify({ v: 1, protectedConfig, local: nextLocal });
+      if (Buffer.byteLength(stateText) > MAX_BYTES) throw new Error('密码库过大');
+      const target = await chooseExportTarget('备份原密码库并新建', 'PrivateVault-Backup.pvault');
+      if (target === null) return false;
+      await atomicWrite(target, text);
+      // A successful dialog is not enough: verify the complete written backup
+      // before committing the one protected profile+vault state file.
+      if (await readBounded(target) !== text) throw new Error('备份文件写入后验证失败，原密码库没有被替换');
+      await fs.mkdir(dataDir, { recursive: true });
+      await atomicWrite(stateFile, stateText);
+      profile = nextProfile; local = clone(nextLocal);
+      return true;
+    });
+    writes = job;
+    try { return await job; } finally { backupActive = false; }
   }
   const host = {
     getConfig: async () => { await load(); return profile ? { ...profile, deviceLabel: 'Windows' } : null; },
     readLocal: async () => { await load(); return clone(local); },
     writeState,
+    backupAndReplace,
     writeLocal: async value => {
+      if (backupActive) throw new Error('正在备份并新建密码库，请等待完成');
       if (blockedWrites) throw new Error('本地库已损坏，已停止写入以防覆盖数据');
-      await load();
-      if (!profile) throw new Error('请先导入文件恢复现有密码库');
-      return writeState(profile, value);
+      const text = validateLocal(value), nextLocal = JSON.parse(text);
+      const job = writes.catch(() => {}).then(async () => {
+        await load();
+        if (!profile) throw new Error('请先导入文件恢复现有密码库');
+        validateLocal(nextLocal, profile.vaultId);
+        return commitState(profile, nextLocal, text);
+      });
+      writes = job;
+      return job;
     },
     request: async (method, route, body) => {
       await load();
+      if (backupActive) throw new Error('正在备份并新建密码库，已暂停云同步');
       if (!profile || profile.mode !== 'server') throw new Error('文件模式不进行云同步');
       if (!['GET', 'PUT'].includes(method) || route !== '/v1/vault') throw new Error('无效同步请求');
       if (method === 'GET' && body !== undefined) throw new Error('读取同步请求不能携带内容');
@@ -264,19 +334,10 @@ function createHost({ config, dataDir, clipboard, shell, safeStorage, dialog, ge
       return readBounded(result.filePaths[0]);
     },
     saveExportFile: async text => {
+      if (backupActive) throw new Error('正在备份并新建密码库，请等待完成');
       if (typeof text !== 'string' || !text.length || Buffer.byteLength(text, 'utf8') > MAX_BYTES) throw new Error('导出文件格式或大小无效');
-      if (!dialog?.showSaveDialog) throw new Error('文件保存暂不可用');
-      const options = { title: '导出密码库文件', defaultPath: 'PrivateVault.pvault', filters: [{ name: '密码库文件', extensions: ['pvault', 'json'] }] };
-      const parent = getWindow();
-      const result = parent ? await dialog.showSaveDialog(parent, options) : await dialog.showSaveDialog(options);
-      if (result.canceled || !result.filePath) return false;
-      const target = path.resolve(result.filePath);
-      const canonicalDir = await fs.realpath(dataDir).catch(() => path.resolve(dataDir));
-      const targetDir = await fs.realpath(path.dirname(target));
-      const canonicalTarget = path.join(targetDir, path.basename(target));
-      const storagePrefix = canonicalDir.toLowerCase() + path.sep;
-      if (canonicalTarget.toLowerCase() === canonicalDir.toLowerCase() || canonicalTarget.toLowerCase().startsWith(storagePrefix))
-        throw new Error('不能将导出文件保存到应用内部数据目录');
+      const target = await chooseExportTarget('导出密码库文件', 'PrivateVault.pvault');
+      if (target === null) return false;
       await atomicWrite(target, text);
       return true;
     },

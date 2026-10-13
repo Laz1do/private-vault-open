@@ -1,4 +1,4 @@
-# 协作接口 v0.2.0
+# 协作接口 v0.3.0（文件与同步协议兼容 v0.2.0）
 
 ## 密码库与密文
 
@@ -24,7 +24,9 @@ Promise API：`getConfig()` -> profile 加 `mode:'file'|'server'` 和可选 devi
 
 ## Client
 
-`await createVaultClient(host)` 提供 `snapshot/subscribe/save/remove/resolve/sync/exportFile/importFile/setMode/configureServer`。快照含 records/status/message/lastSync/configured/pending/mode/serverEndpoint/vaultId/needsImport，不含密钥或原始访问凭据。所有编辑、导入和配置修改串行；模式切换等待在途同步完成，file 模式核心和 native 双重禁网。导出等待已排队编辑。坏文件验证失败不更改配置或数据。
+`await createVaultClient(host)` 提供 `snapshot/subscribe/save/remove/resolve/sync/exportFile/importFile/setMode/configureServer/exportAndCreateNew`。快照另含 `hasHistory/changingVault`，不含密钥或原始访问凭据。所有编辑、导入和配置修改串行；模式切换等待在途同步完成，file 模式核心和 native 双重禁网。导出等待已排队编辑。坏文件验证失败不更改配置或数据。
+
+`save(entry,recordId?,expectedStamp?,expectedVaultId?)` 在队列内同时检查记录版本与可选库身份，防止旧编辑覆盖新合并或写进切换后的库。`exportAndCreateNew()` 暂停新操作、等待已接受的编辑和同步完成，再通过 `host.backupAndReplace(text,nextConfig,nextLocal)` 保存并验证完整旧文件后提交新空库。返回 `{created:false,...snapshot}` 表示取消，旧库保持不变；成功返回 `created:true`。只有具备原生备份接口的 Windows 提供该流程。
 
 旧库缺少原 profile 时 needsImport 为 true，暂停编辑、导出及同步；导入同库文件后验证旧密文、合并并保留原设备身份。getConfig 无 mode 的旧协议按 server 处理，公开新 profile 默认 file。
 
@@ -37,3 +39,9 @@ Promise API：`getConfig()` -> profile 加 `mode:'file'|'server'` 和可选 devi
 - `PUT /v1/vault` 接收 `{expectedRevision,envelope}`，CAS 匹配后原子提交并 revision+1，否则 409。客户端重新读取、因果合并和重试，期间发生的本机编辑必须保留。
 
 服务器对结构、ID 和体积进行检查，无法验证或解密内容；不记录请求正文或凭据。
+
+## 可选 Chrome 助手
+
+MV3 扩展 ID 固定为 `dinagdpfpgbcfepiaabjccimnppakedl`，只允许此扩展连接 `com.local.privatevault` Native Messaging host。Windows 控制台桥接程序采用标准 LE32 长度 + UTF-8 JSON 帧（上限 256 KiB），经随机命名管道连接正在运行的主进程；会话认证信息仅以 CurrentUser DPAPI 包装存于本地。它不持有密码库密钥、不独立解密密码库。软件开关默认关闭，扩展检测全部 HTTPS 表单需要用户授予可选网站权限。
+
+浏览器请求转发给软件已有的单例 Client。`status/matches/fill/stage/draft/confirm/dismiss` 分别查询状态、返回账号摘要、点击后返回指定记录的密码、暂存表单候选、查看候选、确认写入和忽略。网页内容脚本只能暂存自己所在顶层 HTTPS 文档的候选；查询密码及确认写入仅接受扩展 popup。填写绑定当前页面 documentId、精确 HTTPS origin 和记录版本，不提交登录。候选只驻留内存，十分钟失效；切库或关闭助手清除。确认仍按原有本地存储、服务器同步和冲突规则提交。

@@ -1,4 +1,5 @@
 import { createVaultClient } from '../core/vault.js';
+import { initBrowserAssistant } from './browser-assistant.js';
 
 const $ = (id) => document.getElementById(id);
 const shell = $('app-shell');
@@ -21,6 +22,16 @@ let booting = false;
 let fatal = false;
 let fileBusy = false;
 let settingsOpening = false;
+let page = 'passwords';
+let onboarding = false;
+let newVaultBusy = false;
+let browserSettings = { enabled: false, connected: false, registered: false };
+let browserBusy = false;
+let browserAssistant = null;
+let lastInput = 'pointer';
+let modalCloseTimer = null;
+let toastHideTimer = null;
+const completedVaultIds = new Set();
 const collator = new Intl.Collator('zh-CN', { numeric: true, sensitivity: 'base' });
 
 const icons = {
@@ -36,6 +47,9 @@ const icons = {
   warning: ['m12 3 10 18H2L12 3Z', 'M12 9v5M12 17h.01'],
   key: ['M10.5 14.5 3 22M6 19l-2-2M9 16l-2-2', 'M21 8a5 5 0 1 1-10 0 5 5 0 0 1 10 0Z'],
   search: ['M16 16l5 5', 'M17 10a7 7 0 1 1-14 0 7 7 0 0 1 14 0Z'],
+  browser: ['M3 9h18M7 6.5h.1M10 6.5h.1', 'M6 4h12a3 3 0 0 1 3 3v10a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3V7a3 3 0 0 1 3-3Z'],
+  file: ['M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9ZM14 3v6h6M8 14h8M8 17h5'],
+  settings: ['M4 6h16M4 12h16M4 18h16', 'M8 4v4M16 10v4M10 16v4'],
 };
 
 function el(tag, className, text) {
@@ -69,10 +83,17 @@ function button(label, className, action, iconName, testId) {
 function toast(message, tone = 'success') {
   const node = $('toast');
   clearTimeout(toastTimer);
+  clearTimeout(toastHideTimer);
   node.textContent = message;
   node.dataset.tone = tone;
   node.hidden = false;
-  toastTimer = setTimeout(() => { node.hidden = true; }, tone === 'error' ? 6000 : 3200);
+  // Transitions retarget smoothly when a second action arrives before dismissal.
+  void node.offsetWidth;
+  node.classList.add('is-visible');
+  toastTimer = setTimeout(() => {
+    node.classList.remove('is-visible');
+    toastHideTimer = setTimeout(() => { node.hidden = true; }, 200);
+  }, tone === 'error' ? 6000 : 3200);
 }
 
 function errorText(error) {
@@ -85,15 +106,90 @@ function errorText(error) {
     vault_too_large: '密码库已达到容量限制，请精简备注后重试。',
     invalid_vault: '密码库文件无法读取，请检查本地文件。',
     invalid_envelope: '密码库文件无法读取，请检查本地文件。',
-    decrypt_failed: '无法解密密码库，请使用与你的密码库配套的专属安装包。',
-    invalid_config: '应用配置不完整，请使用你保存的专属安装包。',
+    decrypt_failed: '无法解密密码库，请导入带有原密钥的恢复文件。',
+    invalid_config: '本地配置无法读取，请检查原密码库的恢复文件。',
     invalid_file: '文件格式无效，请选择由本软件导出的密码库文件。',
     different_vault: '此设备已有其他密码库的记录，无法导入不同的密码库。',
     different_key: '这个文件的密钥与当前密码库不一致，原数据已保留。',
     needs_import: '请先导入文件，恢复现有密码库。',
     server_not_configured: '请先填写服务器地址和同步凭据。',
+    operation_in_progress: '当前操作还没有完成，请稍候。',
+    browser_disabled: '请先开启浏览器助手。',
+    vault_changing: '正在备份并新建密码库，请等待完成。',
   };
   return messages[error?.code] || '操作未完成，请稍后重试。';
+}
+
+function onboardingDone(vaultId) {
+  if (completedVaultIds.has(vaultId)) return true;
+  try { return localStorage.getItem('private-vault-onboarding') === vaultId; }
+  catch { return false; }
+}
+
+function finishOnboarding() {
+  if (!snapshot.vaultId || snapshot.needsImport) return;
+  completedVaultIds.add(snapshot.vaultId);
+  try { localStorage.setItem('private-vault-onboarding', snapshot.vaultId); } catch {}
+  onboarding = false;
+  renderPage(); renderStatus();
+}
+
+const pageNames = { passwords: ['个人空间', '密码库'], browser: ['可选功能', '浏览器助手'], files: ['随身副本', '文件与恢复'], settings: ['应用偏好', '设置'] };
+
+function renderPage() {
+  $('page-eyebrow').textContent = onboarding ? '欢迎使用' : pageNames[page][0];
+  $('page-title').textContent = onboarding ? '开始使用' : pageNames[page][1];
+  $('workspace').hidden = onboarding || page !== 'passwords';
+  for (const name of ['browser', 'files', 'settings']) $('page-' + name).hidden = onboarding || page !== name;
+  $('onboarding').hidden = !onboarding;
+  for (const name of Object.keys(pageNames)) {
+    const nav = $('nav-' + name);
+    nav.classList.toggle('is-active', name === page && !onboarding);
+    nav.disabled = onboarding || newVaultBusy;
+    nav.setAttribute('aria-label', pageNames[name][1]);
+    if (name === page && !onboarding) nav.setAttribute('aria-current', 'page');
+    else nav.removeAttribute('aria-current');
+  }
+}
+
+function navigate(name, focusHeading = false) {
+  if (onboarding || newVaultBusy || !pageNames[name]) return;
+  page = name;
+  renderPage();
+  if (name === 'browser') refreshBrowserSettings();
+  if (focusHeading) {
+    const heading = name === 'passwords' ? $('records-heading') : $(name + '-heading');
+    heading.tabIndex = -1;
+    heading.focus({ preventScroll: true });
+  }
+}
+
+function renderBrowserSettings() {
+  const toggle = $('browser-enabled');
+  toggle.checked = browserSettings.enabled === true;
+  toggle.disabled = !host?.setBrowserEnabled || !client || snapshot.needsImport || browserBusy || newVaultBusy;
+  $('open-extension-folder').disabled = !host?.openExtensionFolder || browserBusy;
+  const badge = $('browser-connection');
+  badge.textContent = !host?.getBrowserSettings ? '浏览器助手当前支持 Windows + Chrome' : !browserSettings.enabled ? '助手已关闭' : browserSettings.connected ? 'Chrome 已连接' : !browserSettings.registered ? '连接尚未就绪，请重新打开软件' : '等待 Chrome 扩展连接';
+  badge.dataset.status = browserSettings.enabled && browserSettings.connected ? 'connected' : 'idle';
+}
+
+async function refreshBrowserSettings() {
+  if (!host?.getBrowserSettings) { renderBrowserSettings(); return; }
+  try { browserSettings = await host.getBrowserSettings(); }
+  catch { /* A temporary connection check must not interrupt password access. */ }
+  renderBrowserSettings();
+}
+
+async function toggleBrowser() {
+  if (browserBusy || !host?.setBrowserEnabled) return;
+  const enabled = $('browser-enabled').checked;
+  browserBusy = true; renderBrowserSettings();
+  try {
+    browserSettings = await host.setBrowserEnabled(enabled);
+    toast(enabled ? '浏览器助手已开启，请在 Chrome 加载扩展' : '浏览器助手已关闭');
+  } catch { toast('未能更改浏览器助手，请稍后重试。', 'error'); }
+  finally { browserBusy = false; await refreshBrowserSettings(); }
 }
 
 function versionStamp(record) {
@@ -143,7 +239,7 @@ function renderStatus() {
   $('sync-button').disabled = !client || needsImport || (!configured && status !== 'error') || status === 'syncing';
   $('sync-button').querySelector('span').textContent = !configured && status === 'error' ? '重试保存' : '同步';
   $('sync-button').setAttribute('aria-label', !configured && status === 'error' ? '重试保存到此设备' : '立即同步');
-  $('add-button').disabled = !client || needsImport;
+  $('add-button').disabled = !client || needsImport || onboarding || newVaultBusy || fileBusy;
   $('mode-file').disabled = !client || needsImport || fileBusy;
   $('mode-server').disabled = !client || needsImport || fileBusy;
   $('mode-file').classList.toggle('is-active', mode === 'file');
@@ -153,11 +249,17 @@ function renderStatus() {
   $('import-button').disabled = !client || fileBusy;
   $('export-button').disabled = !client || needsImport || fileBusy;
   $('settings-button').disabled = !client || needsImport || fileBusy;
+  $('new-vault-button').disabled = !client || needsImport || fileBusy || newVaultBusy || typeof client.exportAndCreateNew !== 'function';
+  $('onboarding-new').disabled = !client || fileBusy || newVaultBusy;
+  $('onboarding-import').disabled = !client || fileBusy || newVaultBusy;
+  search.disabled = !client || needsImport || newVaultBusy || onboarding;
+  $('mode-description').textContent = mode === 'file' ? '文件模式下，修改保存在本地，需要自行导出更新文件。' : configured ? '服务器模式下，修改先保存在本地，联网后自动同步。服务器只保存加密后的密码库。' : '服务器模式还需要连接设置。当前修改继续保存在本地。';
   const note = $('connection-note');
   const message = fatal ? !host ? '请从已安装的私人密码库应用打开。' : '无法读取密码库，请检查本地文件，原数据不会被自动清空。' : !client ? '' : needsImport ? '发现旧版密码库。请导入含原密钥的密码库文件恢复，原文件会保留。' : status === 'error' ? (snapshot.message || '操作未完成，请稍后重试。') : mode === 'file' ? '' : !configured ? '服务器尚未设置。你仍可在此设备查看和编辑密码。' : status === 'offline' ? pending ? '暂时无法连接，修改已保存在本地。下次联网打开时会自动同步。' : '暂时无法连接，仍可查看和编辑本地密码。' : '';
   note.textContent = message;
   note.hidden = !message;
   note.dataset.tone = status === 'error' || fatal ? 'error' : 'neutral';
+  renderBrowserSettings();
 }
 
 function renderList() {
@@ -198,6 +300,7 @@ function renderList() {
 }
 
 function selectRecord(id) {
+  if (newVaultBusy || onboarding) return;
   selectedId = id;
   shell.dataset.view = 'detail';
   renderList();
@@ -377,7 +480,18 @@ function conflictView(record) {
 }
 
 function onSnapshot(next) {
+  const previousVaultId = snapshot.vaultId;
   snapshot = next;
+  if (previousVaultId && previousVaultId !== snapshot.vaultId) {
+    selectedId = null; query = ''; search.value = ''; filter = 'all'; shell.dataset.view = 'list';
+    clearTimeout(modalCloseTimer); modalStack = []; layer.classList.remove('is-open'); layer.hidden = true;
+    modalCard.replaceChildren(); shell.inert = false; modalReturnFocus = null;
+  }
+  if (!snapshot.needsImport && (snapshot.hasHistory || snapshot.records.length)) {
+    completedVaultIds.add(snapshot.vaultId);
+    try { localStorage.setItem('private-vault-onboarding', snapshot.vaultId); } catch {}
+  }
+  onboarding = !newVaultBusy && !!client && !snapshot.needsImport && !snapshot.hasHistory && !snapshot.records.length && !onboardingDone(snapshot.vaultId);
   if (selectedId && !snapshot.records.some((record) => record.id === selectedId)) { selectedId = null; shell.dataset.view = 'list'; }
   const editing = modalStack.find((modal) => modal.type === 'editor');
   // A failed disk write retains the new record in the core's current session.
@@ -396,23 +510,34 @@ function onSnapshot(next) {
   renderStatus();
   renderList();
   renderDetail();
+  renderPage();
 }
 
 function openModal(modal) {
+  clearTimeout(modalCloseTimer);
   if (!modalStack.length) {
     modalReturnFocus = document.activeElement;
     shell.inert = true;
   }
   modalStack.push(modal);
   layer.hidden = false;
+  layer.style.pointerEvents = '';
+  layer.classList.toggle('instant', lastInput === 'keyboard');
   renderModal();
+  void layer.offsetWidth;
+  layer.classList.add('is-open');
 }
 
 function closeModal() {
+  if (!modalStack.length) return;
   modalStack.pop();
   if (modalStack.length) { renderModal(); return; }
-  layer.hidden = true;
-  modalCard.replaceChildren();
+  layer.classList.toggle('instant', lastInput === 'keyboard');
+  layer.classList.remove('is-open');
+  layer.style.pointerEvents = 'none';
+  const finish = () => { if (!modalStack.length) { layer.hidden = true; modalCard.replaceChildren(); } };
+  if (lastInput === 'keyboard') finish();
+  else modalCloseTimer = setTimeout(finish, 200);
   shell.inert = false;
   if (modalReturnFocus?.isConnected) modalReturnFocus.focus({ preventScroll: true });
   else detail.focus({ preventScroll: true });
@@ -432,7 +557,7 @@ function requestCloseModal() {
 }
 
 function openEditor(record) {
-  if (!client || snapshot.needsImport) return;
+  if (!client || snapshot.needsImport || onboarding || newVaultBusy || fileBusy) return;
   const entry = record?.entry || { title: '', username: '', password: '', url: '', notes: '' };
   openModal({ type: 'editor', recordId: record?.id || null, existingIds: new Set(snapshot.records.map((item) => item.id)), baseline: versionStamp(record), original: { ...entry }, draft: { ...entry }, saving: false, stale: false });
 }
@@ -625,6 +750,7 @@ async function importFile() {
     const text = await host.chooseImportFile();
     if (text === null) return;
     await client.importFile(text);
+    finishOnboarding();
     if (!selectedId) selectedId = snapshot.records[0]?.id || null;
     renderList(); renderDetail();
     toast('文件已导入');
@@ -637,9 +763,27 @@ async function exportFile() {
   fileBusy = true; renderStatus();
   try {
     const text = await client.exportFile();
-    if (await host.saveExportFile(text)) toast('已导出，请妥善保管文件');
+    if (await host.saveExportFile(text)) toast('恢复文件已生成，请妥善保管');
   } catch (error) { toast(errorText(error), 'error'); }
   finally { fileBusy = false; renderStatus(); }
+}
+
+function confirmNewVault() {
+  if (!client || snapshot.needsImport || fileBusy || newVaultBusy || modalStack.length) return;
+  openModal({ type: 'confirm', title: '新建一个独立密码库？', text: '先选择位置，保存当前库的完整恢复文件。成功保存后，本地会切换到新的空库。\n\n新的库有自己的密钥，从文件模式开始。取消保存会继续使用当前库。', confirm: '保存旧库并新建', danger: false, testId: 'confirm-new-vault', onConfirm: async () => {
+    newVaultBusy = true; fileBusy = true; renderStatus(); renderPage();
+    try {
+      const result = await client.exportAndCreateNew();
+      if (!result.created) {
+        closeModal(); toast('已取消，继续使用当前密码库'); return;
+      }
+      // Snapshot emission already invalidated old drafts, selection and browser candidates.
+      finishOnboarding(); page = 'passwords'; shell.dataset.view = 'list';
+      toast('新的密码库已准备好，旧库恢复文件已保存');
+    } finally {
+      newVaultBusy = false; fileBusy = false; renderStatus(); renderPage();
+    }
+  } });
 }
 
 async function changeMode(mode) {
@@ -713,11 +857,14 @@ async function initialize() {
   try {
     if (!host) throw new Error('host_unavailable');
     client = await createVaultClient(host);
+    browserAssistant?.dispose?.();
+    browserAssistant = initBrowserAssistant(client, host);
     unsubscribe?.();
     booting = false;
     unsubscribe = client.subscribe(onSnapshot);
     if (host.__testMode === true) Object.defineProperty(window, '__vaultClient', { value: Object.freeze({ snapshot: () => client.snapshot() }), configurable: true });
     await synchronize();
+    await refreshBrowserSettings();
   } catch (error) {
     client = null;
     booting = false;
@@ -725,6 +872,7 @@ async function initialize() {
     renderStatus();
     renderList();
     renderDetail();
+    renderPage();
     if (host) toast(errorText(error), 'error');
   }
 }
@@ -736,6 +884,32 @@ $('export-button').addEventListener('click', exportFile);
 $('settings-button').addEventListener('click', openServerSettings);
 $('mode-file').addEventListener('click', () => changeMode('file'));
 $('mode-server').addEventListener('click', () => changeMode('server'));
+$('new-vault-button').addEventListener('click', confirmNewVault);
+$('onboarding-new').addEventListener('click', () => { if (!client || fileBusy) return; finishOnboarding(); toast('你的密码库已准备好，可在“文件与恢复”生成恢复文件'); });
+$('onboarding-import').addEventListener('click', importFile);
+for (const name of Object.keys(pageNames)) $('nav-' + name).addEventListener('click', () => navigate(name, lastInput === 'keyboard'));
+$('browser-enabled').addEventListener('change', toggleBrowser);
+$('copy-extensions-url').addEventListener('click', () => copy('chrome://extensions', '扩展管理地址'));
+$('open-extension-folder').addEventListener('click', async () => {
+  if (!host?.openExtensionFolder || browserBusy) return;
+  browserBusy = true; renderBrowserSettings();
+  try { await host.openExtensionFolder(); toast('扩展目录已打开，请在 Chrome 选择这个文件夹'); }
+  catch { toast('无法打开扩展目录，请从 GitHub 下载扩展 ZIP 并解压。', 'error'); }
+  finally { browserBusy = false; await refreshBrowserSettings(); }
+});
+$('open-source').addEventListener('click', async () => {
+  try { await host.openExternal('https://github.com/Laz1do/private-vault-open/releases'); }
+  catch { toast('无法打开浏览器，请稍后重试。', 'error'); }
+});
+for (const [id, name] of [['browser-feature-icon', 'browser'], ['files-feature-icon', 'file'], ['settings-feature-icon', 'settings'], ['onboarding-icon', 'key']]) $(id).append(icon(name, id === 'onboarding-icon' ? 33 : 22));
+document.documentElement.dataset.input = 'pointer';
+document.addEventListener('pointerdown', () => { lastInput = 'pointer'; document.documentElement.dataset.input = 'pointer'; }, true);
+document.addEventListener('keydown', () => { lastInput = 'keyboard'; document.documentElement.dataset.input = 'keyboard'; }, true);
+window.addEventListener('vault-browser-status', refreshBrowserSettings);
+host?.onBrowserSettings?.(settings => { browserSettings = settings; renderBrowserSettings(); });
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', updateThemeLabel);
+function updateThemeLabel() { $('theme-label').textContent = window.matchMedia('(prefers-color-scheme: dark)').matches ? '系统深色' : '系统浅色'; }
+updateThemeLabel();
 search.addEventListener('input', () => { query = search.value; renderList(); });
 $('filter-all').addEventListener('click', () => { filter = 'all'; renderList(); });
 $('filter-conflict').addEventListener('click', () => { filter = 'conflict'; renderList(); });
@@ -752,16 +926,16 @@ document.addEventListener('keydown', (event) => {
     }
     return;
   }
-  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); returnToList(); search.focus(); search.select(); }
-  else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'n') { event.preventDefault(); openEditor(); }
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); if (onboarding) return; navigate('passwords'); returnToList(); search.focus(); search.select(); }
+  else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'n') { event.preventDefault(); if (onboarding) return; navigate('passwords'); openEditor(); }
   else if (event.key === 'Escape') { if (query) { query = ''; search.value = ''; renderList(); } returnToList(); }
 });
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') synchronize();
-  else { clearTimeout(toastTimer); $('toast').hidden = true; }
+  else { clearTimeout(toastTimer); clearTimeout(toastHideTimer); $('toast').classList.remove('is-visible'); $('toast').hidden = true; }
 });
 window.addEventListener('online', () => synchronize());
-window.addEventListener('focus', () => synchronize());
+window.addEventListener('focus', () => { synchronize(); if (page === 'browser') refreshBrowserSettings(); });
 window.addEventListener('vault-resume', () => synchronize());
 window.addEventListener('vault-back', (event) => {
   if (modalStack.length) { event.preventDefault(); requestCloseModal(); }

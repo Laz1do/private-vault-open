@@ -303,11 +303,13 @@ export async function createVaultClient(host) {
   let status = needsImport ? 'error' : 'local';
   let message = needsImport ? '发现旧密码库，请导入含原密钥的配套文件以恢复；原数据没有被覆盖。' : configured() ? '本地密码库已就绪。' : localMessage();
   let pending = !needsImport && local !== null, lastSync = null, generation = 0, needsPersist = false;
-  let localQueue = Promise.resolve(), syncing = null, profileChanges = 0;
+  let localQueue = Promise.resolve(), syncing = null, profileChanges = 0, changingVault = false;
+  const pendingProfileChanges = new Set();
   const listeners = new Set();
   const snapshot = () => ({ records: vault ? listRecords(vault) : [], status, message, lastSync, configured: configured(), pending,
     mode: config?.mode ?? 'file', serverEndpoint: config?.endpoint ?? null,
-    vaultId: config?.vaultId ?? storedEnvelope.vaultId, needsImport });
+    vaultId: config?.vaultId ?? storedEnvelope.vaultId, needsImport, changingVault,
+    hasHistory: vault ? Object.keys(vault.records).length > 0 : needsImport });
   const emit = () => { for (const listener of listeners) { try { listener(snapshot()); } catch { /* A view cannot break persistence. */ } } };
   function serialized(fn) {
     const work = localQueue.then(fn);
@@ -320,7 +322,9 @@ export async function createVaultClient(host) {
     catch { fail('persistence_failed', '本地保存失败，修改仍保留在当前会话；请重试同步。'); }
   }
   function requireReady() { if (needsImport) fail('needs_import', '请先导入配套密码库文件恢复原数据。'); }
+  function requireMutable() { if (changingVault) fail('vault_changing', '正在备份并新建密码库，请等待完成。'); }
   async function edit(operation) {
+    requireMutable();
     let result;
     try {
       result = await serialized(async () => {
@@ -342,7 +346,7 @@ export async function createVaultClient(host) {
   }
   function sync() {
     if (syncing) return syncing;
-    if (needsImport || profileChanges) return Promise.resolve(snapshot());
+    if (needsImport || profileChanges || changingVault) return Promise.resolve(snapshot());
     // Install the in-flight promise before notifying listeners (which may call sync).
     syncing = Promise.resolve().then(runSync).finally(() => { syncing = null; });
     return syncing;
@@ -400,19 +404,57 @@ export async function createVaultClient(host) {
     return snapshot();
   }
   async function changeProfile(operation) {
+    requireMutable();
     profileChanges++;
-    let completed = false;
+    const work = (async () => {
+      let completed = false;
+      try {
+        if (syncing) await syncing;
+        const result = await serialized(operation);
+        completed = true;
+        return result;
+      } catch (error) {
+        if (error.code === 'persistence_failed') { status = 'error'; message = error.message; emit(); }
+        throw error;
+      } finally {
+        profileChanges--;
+        if (completed && !profileChanges && !changingVault && configured()) void sync();
+      }
+    })();
+    pendingProfileChanges.add(work);
+    // Attach cleanup without an unobserved rejected promise.
+    work.then(() => pendingProfileChanges.delete(work), () => pendingProfileChanges.delete(work));
+    return work;
+  }
+  function portableText() {
+    const { mode: _, ...profile } = config;
+    const text = JSON.stringify({ format: 'private-vault-file', version: 1, profile, vault: checkedVault(vault) });
+    parsePortableFile(text);
+    return text;
+  }
+  async function exportAndCreateNew() {
+    requireMutable(); requireReady();
+    if (typeof host.backupAndReplace !== 'function') fail('invalid_config', '此客户端暂不支持备份后新建密码库，请更新软件。');
+    // Reserve the whole transaction immediately, before waiting on prior work.
+    // Already accepted edits/profile changes finish into the old-vault backup.
+    changingVault = true; profileChanges++; emit();
     try {
-      if (syncing) await syncing;
-      const result = await serialized(operation);
-      completed = true;
-      return result;
-    } catch (error) {
-      if (error.code === 'persistence_failed') { status = 'error'; message = error.message; emit(); }
-      throw error;
+      await Promise.allSettled([...(syncing ? [syncing] : []), ...pendingProfileChanges]);
+      const created = await serialized(async () => {
+        requireReady();
+        const text = portableText(), nextConfig = newProfile(), nextVault = createVault(nextConfig.vaultId);
+        const envelope = await encryptVault(nextVault, nextConfig.keyB64);
+        const replaced = await host.backupAndReplace(text, { ...nextConfig }, { deviceId, envelope });
+        if (replaced === false) return false;
+        if (replaced !== true) fail('persistence_failed', '新建结果无法确认，原密码库仍保留在当前会话。');
+        config = nextConfig; vault = nextVault; storedEnvelope = envelope;
+        needsImport = false; needsPersist = false; generation++; pending = false; status = 'local'; lastSync = null;
+        message = '已备份原密码库并创建新的独立密码库。';
+        return true;
+      });
+      return { ...snapshot(), changingVault: false, created };
     } finally {
-      profileChanges--;
-      if (completed && !profileChanges && configured()) void sync();
+      changingVault = false; profileChanges--; emit();
     }
   }
   async function adopt(nextConfig, nextVault) {
@@ -426,7 +468,13 @@ export async function createVaultClient(host) {
   }
   return Object.freeze({ snapshot,
     subscribe(fn) { if (typeof fn !== 'function') fail('invalid_config', '订阅函数无效。'); listeners.add(fn); try { fn(snapshot()); } catch {} return () => listeners.delete(fn); },
-    save(entry, recordId = null, expectedStamp = undefined) { return edit(current => {
+    save(entry, recordId = null, expectedStamp = undefined, expectedVaultId = undefined) { return edit(current => {
+      // A browser's new-record draft has no record ID to detect a queued
+      // library switch. Validate its originating library inside the disk queue.
+      if (expectedVaultId !== undefined) {
+        validId(expectedVaultId, 'invalid_config');
+        if (current.vaultId !== expectedVaultId) fail('stale_vault', '密码库已切换，请重新检查内容后保存。');
+      }
       // Check inside the disk queue: a remote/file merge may already be queued
       // when the view submits a draft of the version it originally displayed.
       if (expectedStamp !== undefined) {
@@ -442,15 +490,13 @@ export async function createVaultClient(host) {
     async remove(recordId) { await edit(current => ({ next: deleteRecord(current, recordId, deviceId) })); return snapshot(); },
     async resolve(recordId, versionId) { await edit(current => ({ next: resolveRecord(current, recordId, versionId, deviceId) })); return snapshot(); },
     sync,
-    exportFile() { return serialized(async () => {
+    exportAndCreateNew,
+    async exportFile() { requireMutable(); return serialized(async () => {
       requireReady();
-      const { mode: _, ...profile } = config;
-      const file = { format: 'private-vault-file', version: 1, profile, vault: checkedVault(vault) };
-      const text = JSON.stringify(file);
-      parsePortableFile(text);
-      return text;
+      return portableText();
     }); },
     async importFile(text) {
+      requireMutable();
       const file = parsePortableFile(text);
       return changeProfile(async () => {
         let nextVault;

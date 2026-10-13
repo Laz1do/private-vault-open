@@ -35,6 +35,7 @@ foreach ($folder in @($assetsRoot,$classRoot,$dexRoot,$generatedRoot)) { New-Ite
 Copy-Item -LiteralPath (Join-Path $projectRoot 'ui') -Destination (Join-Path $assetsRoot 'ui') -Recurse
 New-Item -ItemType Directory -Path (Join-Path $assetsRoot 'core') -Force | Out-Null
 Copy-Item -LiteralPath (Join-Path $projectRoot 'core\vault.js') -Destination (Join-Path $assetsRoot 'core\vault.js')
+Copy-Item -LiteralPath (Join-Path $projectRoot 'core\browser.js') -Destination (Join-Path $assetsRoot 'core\browser.js')
 Copy-Item -LiteralPath (Join-Path $projectRoot 'android\bridge.js') -Destination (Join-Path $assetsRoot 'ui\android-bridge.js')
 $htmlPath=Join-Path $assetsRoot 'ui\index.html'
 $html=[IO.File]::ReadAllText($htmlPath)

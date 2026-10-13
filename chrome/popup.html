@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>私密密码库</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M7 10V7a5 5 0 0 1 10 0v3M6 10h12a1 1 0 0 1 1 1v9H5v-9a1 1 0 0 1 1-1Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M12 14v3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></div>
+    <div><h1>私密密码库</h1><p>浏览器助手</p></div>
+    <button id="refresh" class="icon-button" aria-label="重新连接" title="重新连接"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M6.1 7a7 7 0 0 1 11.8-1L20 9M4 15l2.1 3A7 7 0 0 0 17.9 17" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+  </header>
+  <main>
+    <div class="site-card"><div class="site-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.6"/><path d="M3 12h18M12 3c5 5 5 13 0 18-5-5-5-13 0-18Z" stroke="currentColor" stroke-width="1.6"/></svg></div><div class="site-copy"><span class="eyebrow">当前网站</span><strong id="host">正在读取…</strong></div><span id="connection" class="connection">连接中</span></div>
+    <p id="message" class="message" role="status" aria-live="polite" hidden></p>
+    <div id="disabled" class="notice" hidden></div>
+    <section id="save-section" class="save-card" hidden aria-labelledby="save-heading">
+      <div class="section-heading"><h2 id="save-heading">保存这个账号</h2><span class="new-chip">待确认</span></div>
+      <p id="save-source" class="muted"></p>
+      <form id="save-form">
+        <label class="field-label" for="save-target">保存到</label>
+        <select id="save-target"><option value="">新建记录</option></select>
+        <div id="title-field"><label class="field-label" for="save-title">名称</label><input id="save-title" maxlength="200" required autocomplete="off"></div>
+        <label class="field-label" for="save-username">账号</label>
+        <input id="save-username" maxlength="1000" autocomplete="off" spellcheck="false">
+        <label class="field-label" for="save-password">密码</label>
+        <div class="password-wrap"><input id="save-password" type="password" maxlength="4096" required autocomplete="off"><button id="reveal" type="button" class="reveal" aria-label="显示密码">显示</button></div>
+        <p id="update-note" class="field-note" hidden>更新账号与密码，保留原记录的名称和备注。</p>
+        <div class="form-actions"><button id="dismiss" type="button" class="secondary">忽略</button><button id="save" type="submit" class="primary">确认保存</button></div>
+      </form>
+    </section>
+    <section id="accounts-section" aria-labelledby="accounts-heading">
+      <div class="section-heading"><h2 id="accounts-heading">匹配账号</h2><span id="account-count" class="count"></span></div>
+      <div id="accounts" class="accounts"></div>
+      <div id="empty" class="empty" hidden><div class="empty-icon" aria-hidden="true">⌁</div><strong>这个网站还没有账号</strong><p>在软件里添加网址，或提交网站表单后在这里确认保存。</p></div>
+      <p id="fill-note" class="field-note">选择账号即可填写，然后由你点击网站登录。</p>
+    </section>
+  </main>
+  <footer>
+    <div class="detection-row"><div><strong>网站检测</strong><p id="detection-note">开启后，在所有 HTTPS 网站识别提交的密码。</p></div><button id="detection" class="secondary compact" type="button">开启</button></div>
+    <p class="footer-note">密码由本机客户端保存 · 不自动提交登录</p>
+  </footer>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>
