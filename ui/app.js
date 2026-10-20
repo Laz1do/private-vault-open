@@ -32,11 +32,14 @@ let lastInput = 'pointer';
 let modalCloseTimer = null;
 let toastHideTimer = null;
 const completedVaultIds = new Set();
+const copyStates = new Map();
+let copySequence = 0;
 const collator = new Intl.Collator('zh-CN', { numeric: true, sensitivity: 'base' });
 
 const icons = {
   plus: ['M12 5v14M5 12h14'],
   copy: ['M9 8V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-3', 'M5 8h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-9a2 2 0 0 1 2-2Z'],
+  check: ['m5 12 4 4L19 6'],
   edit: ['m15 4 5 5M4 20l4-1 12-12a2.1 2.1 0 0 0-3-3L5 16l-1 4Z'],
   trash: ['M4 7h16M9 7V4h6v3M7 7l1 14h8l1-14M10 11v6M14 11v6'],
   back: ['m15 5-7 7 7 7'],
@@ -150,6 +153,23 @@ function renderPage() {
     if (name === page && !onboarding) nav.setAttribute('aria-current', 'page');
     else nav.removeAttribute('aria-current');
   }
+  positionNavigationIndicator();
+}
+
+function positionNavigationIndicator(resizing = false) {
+  const indicator = $('nav-indicator');
+  const target = $('nav-' + page);
+  indicator.hidden = onboarding;
+  if (onboarding || !target) return;
+  if (resizing) indicator.dataset.ready = 'false';
+  indicator.style.width = `${target.offsetWidth}px`;
+  indicator.style.height = `${target.offsetHeight}px`;
+  indicator.style.transform = `translate(${target.offsetLeft}px, ${target.offsetTop}px)`;
+  if (indicator.dataset.ready !== 'true') {
+    // Establish the position before enabling motion, including after a resize.
+    void indicator.offsetWidth;
+    indicator.dataset.ready = 'true';
+  }
 }
 
 function navigate(name, focusHeading = false) {
@@ -253,6 +273,7 @@ function renderStatus() {
   $('onboarding-new').disabled = !client || fileBusy || newVaultBusy;
   $('onboarding-import').disabled = !client || fileBusy || newVaultBusy;
   search.disabled = !client || needsImport || newVaultBusy || onboarding;
+  $('search-submit').disabled = search.disabled;
   $('mode-description').textContent = mode === 'file' ? '文件模式下，修改保存在本地，需要自行导出更新文件。' : configured ? '服务器模式下，修改先保存在本地，联网后自动同步。服务器只保存加密后的密码库。' : '服务器模式还需要连接设置。当前修改继续保存在本地。';
   const note = $('connection-note');
   const message = fatal ? !host ? '请从已安装的私人密码库应用打开。' : '无法读取密码库，请检查本地文件，原数据不会被自动清空。' : !client ? '' : needsImport ? '发现旧版密码库。请导入含原密钥的密码库文件恢复，原文件会保留。' : status === 'error' ? (snapshot.message || '操作未完成，请稍后重试。') : mode === 'file' ? '' : !configured ? '服务器尚未设置。你仍可在此设备查看和编辑密码。' : status === 'offline' ? pending ? '暂时无法连接，修改已保存在本地。下次联网打开时会自动同步。' : '暂时无法连接，仍可查看和编辑本地密码。' : '';
@@ -264,6 +285,7 @@ function renderStatus() {
 
 function renderList() {
   const focusId = document.activeElement?.dataset.recordId;
+  const focusCopyKey = document.activeElement?.dataset.copyKey;
   const scrollTop = list.scrollTop;
   $('record-count').textContent = String(snapshot.records.length);
   $('conflict-count').textContent = String(snapshot.records.filter((record) => record.conflict).length);
@@ -272,19 +294,37 @@ function renderList() {
   $('filter-conflict').classList.toggle('is-active', filter === 'conflict');
   $('filter-conflict').setAttribute('aria-pressed', String(filter === 'conflict'));
   const records = visibleRecords();
+  $('search-result-status').textContent = query.trim() ? `找到 ${records.length} 条记录` : `${records.length} 条记录 · 可直接复制`;
   const children = records.map((record) => {
-    const row = el('button', `record-row${record.id === selectedId ? ' is-selected' : ''}`);
-    row.type = 'button';
-    row.dataset.recordId = record.id;
-    row.dataset.testid = 'record-row';
-    row.setAttribute('aria-label', `${recordTitle(record)}${record.conflict ? '，有待处理的冲突' : ''}`);
-    row.setAttribute('aria-pressed', String(record.id === selectedId));
+    const row = el('div', `record-row${record.id === selectedId ? ' is-selected' : ''}`);
+    row.dataset.recordContainer = record.id;
+    const open = el('button', 'record-open');
+    open.type = 'button';
+    open.dataset.recordId = record.id;
+    open.dataset.testid = 'record-row';
+    open.setAttribute('aria-label', `查看${recordTitle(record)}${record.conflict ? '，有待处理的冲突' : ''}`);
+    open.setAttribute('aria-pressed', String(record.id === selectedId));
     const content = el('span', 'record-row-content');
     content.append(el('span', 'record-row-title', recordTitle(record)), el('span', 'record-row-account', record.entry?.username || record.entry?.url || (record.conflict ? '请选择要保留的版本' : '未填写账号')));
-    row.append(el('span', 'record-avatar', avatarText(recordTitle(record))), content);
-    if (record.conflict) row.append(el('span', 'conflict-mini'));
-    if (record.conflict) row.lastChild.append(icon('warning', 16));
-    row.addEventListener('click', () => selectRecord(record.id));
+    open.append(el('span', 'record-avatar', avatarText(recordTitle(record))), content);
+    if (record.conflict) {
+      const warning = el('span', 'conflict-mini');
+      warning.append(icon('warning', 16));
+      open.append(warning);
+    }
+    open.addEventListener('click', () => selectRecord(record.id));
+    row.append(open);
+    if (!record.conflict) {
+      const actions = el('div', 'record-actions');
+      for (const [field, label] of [['username', '账号'], ['password', '密码']]) {
+        actions.append(makeCopyButton(record.entry[field], label, {
+          text: `复制${label}`, className: 'copy-button quick-copy', testId: `quick-copy-${field}`,
+          key: `list:${snapshot.vaultId}:${record.id}:${versionStamp(record)}:${field}`,
+          getValue: currentRecordValue(record.id, field),
+        }));
+      }
+      row.append(actions);
+    }
     return row;
   });
   if (!children.length) {
@@ -296,7 +336,8 @@ function renderList() {
   }
   list.replaceChildren(...children);
   list.scrollTop = scrollTop;
-  if (focusId) [...list.querySelectorAll('[data-record-id]')].find((row) => row.dataset.recordId === focusId)?.focus({ preventScroll: true });
+  if (focusCopyKey) [...list.querySelectorAll('[data-copy-key]')].find((node) => node.dataset.copyKey === focusCopyKey)?.focus({ preventScroll: true });
+  else if (focusId) [...list.querySelectorAll('[data-record-id]')].find((row) => row.dataset.recordId === focusId)?.focus({ preventScroll: true });
 }
 
 function selectRecord(id) {
@@ -314,13 +355,76 @@ function returnToList() {
   [...list.querySelectorAll('[data-record-id]')].find((row) => row.dataset.recordId === selectedId)?.focus({ preventScroll: true });
 }
 
-async function copy(value, label = '内容') {
-  if (!value) { toast(`还没有填写${label}`); return; }
+function currentRecordValue(recordId, field, versionId) {
+  const vaultId = snapshot.vaultId;
+  return () => {
+    if (snapshot.vaultId !== vaultId || snapshot.needsImport || newVaultBusy) throw new Error('vault_changed');
+    const record = snapshot.records.find(item => item.id === recordId);
+    if (!record || (!versionId && record.conflict)) throw new Error('record_changed');
+    return versionId ? record.versions.find(item => item.id === versionId)?.entry?.[field] : record.entry[field];
+  };
+}
+
+function applyCopyState(node) {
+  const state = copyStates.get(node.dataset.copyKey)?.state;
+  const label = node.dataset.copyLabel;
+  node.classList.toggle('is-copying', state === 'pending');
+  node.classList.toggle('is-copied', state === 'success');
+  node.classList.toggle('is-copy-error', state === 'error');
+  node.disabled = node.dataset.empty === 'true';
+  node.setAttribute('aria-disabled', String(node.disabled || state === 'pending'));
+  node.setAttribute('aria-busy', String(state === 'pending'));
+  node.setAttribute('aria-label', state === 'success' ? `${label}已复制` : state === 'error' ? `复制${label}失败，点击重试` : `复制${label}`);
+  const feedback = node.querySelector('.copy-feedback');
+  feedback.replaceChildren(icon(state === 'error' ? 'warning' : 'check', 16), el('span', '', state === 'error' ? '重试' : '已复制'));
+}
+
+function refreshCopyState(key) {
+  for (const node of document.querySelectorAll('[data-copy-key]')) if (node.dataset.copyKey === key) applyCopyState(node);
+}
+
+function makeCopyButton(value, label, { text = '复制', className = 'copy-button', testId, key, getValue = () => value } = {}) {
+  const node = el('button', className);
+  node.type = 'button';
+  node.dataset.copyKey = key || `copy-${++copySequence}`;
+  node.dataset.copyLabel = label;
+  node.dataset.empty = String(!value);
+  if (testId) node.dataset.testid = testId;
+  const normal = el('span', 'copy-label');
+  normal.append(icon('copy', 16), el('span', '', text));
+  normal.setAttribute('aria-hidden', 'true');
+  const feedback = el('span', 'copy-feedback');
+  feedback.setAttribute('aria-hidden', 'true');
+  node.append(normal, feedback);
+  node.addEventListener('click', () => copy(getValue, label, node));
+  applyCopyState(node);
+  return node;
+}
+
+async function copy(getValue, label, node) {
+  const key = node.dataset.copyKey;
+  if (copyStates.get(key)?.state === 'pending') return;
+  clearTimeout(copyStates.get(key)?.timer);
+  const operation = { state: 'pending' };
+  copyStates.set(key, operation);
+  refreshCopyState(key);
+  $('copy-announcement').textContent = '';
   try {
+    const value = getValue();
+    if (!value) throw new Error('empty_value');
     if (!host?.copyText) throw new Error('clipboard_unavailable');
     await host.copyText(value);
-    toast(`${label}已复制`);
-  } catch { toast('复制失败，请长按或选中文本手动复制。', 'error'); }
+    operation.state = 'success';
+  } catch { operation.state = 'error'; }
+  // A library switch discards its old feedback as well as the old controls.
+  if (copyStates.get(key) !== operation) return;
+  refreshCopyState(key);
+  $('copy-announcement').textContent = operation.state === 'success' ? `${label}已复制` : `复制${label}失败，请点击原按钮重试。`;
+  operation.timer = setTimeout(() => {
+    if (copyStates.get(key) !== operation) return;
+    copyStates.delete(key);
+    refreshCopyState(key);
+  }, operation.state === 'success' ? 1800 : 5000);
 }
 
 function toolbar(record) {
@@ -345,10 +449,11 @@ function fieldRow(label, value, kind, testId) {
   if (testId) display.dataset.testid = testId;
   content.append(el('span', 'field-label', label), display);
   row.append(content);
-  const copyButton = button('复制', 'copy-button', () => copy(value, label), 'copy', `copy-${kind || 'username'}`);
-  copyButton.className = 'copy-button';
-  copyButton.setAttribute('aria-label', `复制${label}`);
-  copyButton.disabled = !value;
+  const record = snapshot.records.find(item => item.id === selectedId);
+  const copyButton = makeCopyButton(value, label, {
+    testId: `copy-${kind || 'username'}`, key: `detail:${snapshot.vaultId}:${selectedId}:${versionStamp(record)}:${kind}`,
+    getValue: currentRecordValue(selectedId, kind),
+  });
   row.append(copyButton);
   return row;
 }
@@ -371,10 +476,11 @@ function urlRow(value) {
     content.append(node);
   } else content.append(el('div', `field-value${!value ? ' empty' : ''}`, value || '未填写'));
   row.append(content);
-  const copyButton = button('复制', 'copy-button', () => copy(value, '网址'), 'copy', 'copy-url');
-  copyButton.className = 'copy-button';
-  copyButton.setAttribute('aria-label', '复制网址');
-  copyButton.disabled = !value;
+  const record = snapshot.records.find(item => item.id === selectedId);
+  const copyButton = makeCopyButton(value, '网址', {
+    testId: 'copy-url', key: `detail:${snapshot.vaultId}:${selectedId}:${versionStamp(record)}:url`,
+    getValue: currentRecordValue(selectedId, 'url'),
+  });
   row.append(copyButton);
   return row;
 }
@@ -387,7 +493,7 @@ function renderDetail() {
     emblem.append(icon(fatal ? 'warning' : 'key', 31));
     empty.append(emblem, el('h2', '', fatal ? '暂时无法打开密码库' : booting ? '正在打开你的密码库' : snapshot.needsImport ? '恢复你的旧版密码库' : snapshot.records.length ? '每一条密码，都在这里' : '把密码，安心放在这里'), el('p', '', fatal ? !host ? '请从已安装的私人密码库应用打开。' : `请检查本地密码库与系统存储。
 本地文件不会被自动清空。` : booting ? '正在读取此设备保存的记录…' : snapshot.needsImport ? '请导入含原密钥的密码库文件。恢复前无法编辑，旧文件会继续保留。' : snapshot.records.length ? `从左侧选择一条记录，即可查看或复制。
-也可以按 Ctrl K 快速搜索。` : `保存账户与密码，在你的电脑和手机间同步。
+输入名称、账号或网址，找到后直接点击复制。` : `保存账户与密码，在你的电脑和手机间同步。
 用文件手动传递，或设置服务器自动同步。`));
     if (fatal) empty.append(button('重新打开', 'secondary', initialize, undefined, 'retry-open'));
     else if (client && snapshot.needsImport) empty.append(button('导入恢复文件', 'primary', importFile, undefined, 'restore-button'));
@@ -455,11 +561,10 @@ function conflictView(record) {
         const field = el('div', 'version-field');
         field.append(el('span', 'field-label', name), el('div', `field-value${key === 'password' ? ' password' : ''}${!value ? ' empty' : ''}`, value || '未填写'));
         if (value && key !== 'title') {
-          const copyButton = el('button', 'icon-button version-copy');
-          copyButton.type = 'button';
-          copyButton.setAttribute('aria-label', `复制版本 ${index + 1} 的${name}`);
-          copyButton.append(icon('copy', 16));
-          copyButton.addEventListener('click', () => copy(value, name));
+          const copyButton = makeCopyButton(value, `版本 ${index + 1} 的${name}`, {
+            className: 'copy-button version-copy', key: `version:${snapshot.vaultId}:${record.id}:${version.id}:${key}`,
+            getValue: currentRecordValue(record.id, key, version.id),
+          });
           field.append(copyButton);
         }
         body.append(field);
@@ -483,6 +588,9 @@ function onSnapshot(next) {
   const previousVaultId = snapshot.vaultId;
   snapshot = next;
   if (previousVaultId && previousVaultId !== snapshot.vaultId) {
+    for (const operation of copyStates.values()) clearTimeout(operation.timer);
+    copyStates.clear();
+    $('copy-announcement').textContent = '';
     selectedId = null; query = ''; search.value = ''; filter = 'all'; shell.dataset.view = 'list';
     clearTimeout(modalCloseTimer); modalStack = []; layer.classList.remove('is-open'); layer.hidden = true;
     modalCard.replaceChildren(); shell.inert = false; modalReturnFocus = null;
@@ -818,8 +926,16 @@ function renderServerSettings(modal) {
   const tokenLabel = el('label', '', '同步凭据 · 请勿公开'); tokenLabel.htmlFor = 'server-token';
   const tokenRow = el('div', 'token-input-row');
   const token = el('input'); token.id = 'server-token'; token.type = 'password'; token.value = modal.token; token.maxLength = 200; token.minLength = 20; token.required = true; token.autocomplete = 'new-password'; token.dataset.testid = 'server-token'; token.spellcheck = false;
-  token.addEventListener('input', () => { modal.token = token.value; });
-  tokenRow.append(token, button('复制', 'secondary', () => copy(modal.token, '同步凭据'), 'copy', 'copy-server-token'));
+  const tokenCopy = makeCopyButton(modal.token, '同步凭据', { className: 'copy-button secondary', testId: 'copy-server-token', getValue: () => token.value });
+  token.addEventListener('input', () => {
+    modal.token = token.value;
+    const key = tokenCopy.dataset.copyKey;
+    clearTimeout(copyStates.get(key)?.timer);
+    copyStates.delete(key);
+    tokenCopy.dataset.empty = String(!token.value);
+    applyCopyState(tokenCopy);
+  });
+  tokenRow.append(token, tokenCopy);
   tokenField.append(tokenLabel, tokenRow);
   const note = el('p', 'form-note', '已填入此密码库的同步凭据。服务器需要配置对应的凭据摘要；保存后启用自动同步。');
   const error = el('div', 'form-error'); error.hidden = true; error.dataset.testid = 'server-settings-error';
@@ -889,7 +1005,9 @@ $('onboarding-new').addEventListener('click', () => { if (!client || fileBusy) r
 $('onboarding-import').addEventListener('click', importFile);
 for (const name of Object.keys(pageNames)) $('nav-' + name).addEventListener('click', () => navigate(name, lastInput === 'keyboard'));
 $('browser-enabled').addEventListener('change', toggleBrowser);
-$('copy-extensions-url').addEventListener('click', () => copy('chrome://extensions', '扩展管理地址'));
+const extensionAddressCopy = makeCopyButton('chrome://extensions', '扩展管理地址', { className: 'inline-copy copy-button', text: 'chrome://extensions', key: 'extensions-url' });
+extensionAddressCopy.id = 'copy-extensions-url';
+$('copy-extensions-url').replaceWith(extensionAddressCopy);
 $('open-extension-folder').addEventListener('click', async () => {
   if (!host?.openExtensionFolder || browserBusy) return;
   browserBusy = true; renderBrowserSettings();
@@ -910,7 +1028,16 @@ host?.onBrowserSettings?.(settings => { browserSettings = settings; renderBrowse
 window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', updateThemeLabel);
 function updateThemeLabel() { $('theme-label').textContent = window.matchMedia('(prefers-color-scheme: dark)').matches ? '系统深色' : '系统浅色'; }
 updateThemeLabel();
+new ResizeObserver(() => positionNavigationIndicator(true)).observe(document.querySelector('.nav-items'));
 search.addEventListener('input', () => { query = search.value; renderList(); });
+$('search-submit').addEventListener('click', () => {
+  if (search.disabled) return;
+  query = search.value;
+  shell.dataset.view = 'list';
+  renderList();
+  list.scrollTop = 0;
+  if (!query.trim()) search.focus();
+});
 $('filter-all').addEventListener('click', () => { filter = 'all'; renderList(); });
 $('filter-conflict').addEventListener('click', () => { filter = 'conflict'; renderList(); });
 layer.addEventListener('click', (event) => { if (event.target === layer) requestCloseModal(); });
@@ -926,9 +1053,7 @@ document.addEventListener('keydown', (event) => {
     }
     return;
   }
-  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); if (onboarding) return; navigate('passwords'); returnToList(); search.focus(); search.select(); }
-  else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'n') { event.preventDefault(); if (onboarding) return; navigate('passwords'); openEditor(); }
-  else if (event.key === 'Escape') { if (query) { query = ''; search.value = ''; renderList(); } returnToList(); }
+  if (event.key === 'Escape') { if (query) { query = ''; search.value = ''; renderList(); } returnToList(); }
 });
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') synchronize();

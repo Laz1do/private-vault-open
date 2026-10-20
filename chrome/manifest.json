@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "私密密码库 · 浏览器助手",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "连接本机私密密码库：选择账号填写，在小窗确认保存或更新。",
   "minimum_chrome_version": "106",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAlA3kq4GhMhbXq4uKg1e/6oLX5XLdBErNL539HjYx7xy6UPTtWV9777JDuxnoxRnjvoAhw+Q/1RfKWC43qhtTENxXGTd+G4b+vxPMStV0D2PkD7lhF+MVnJjyw61zwII3ewNA64VaqN9t0UgBgBi6JXD0O9mDCnkvcMY6QnFS0d2TWMDhQlS8CaFTrArwGd5EDkE04llDb/TS4R8cvtXtn1KW9jPmZOWNcuaq7ycmWkcDDbjd1B9NAq4JpPTjqDLnEQIqonPmNV0Vj/j8KoIgQ5CzfNgmH+tcYgaXDvoK+A7mFMMDae2Uve0U69HwKdx4u71rWUR3jvR/1HNiJXUvvQIDAQAB",

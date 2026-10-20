@@ -1,5 +1,5 @@
 {
-  "name":"private-vault","version":"0.3.0","description":"私密密码库：文件恢复、自建同步与可选 Chrome 填写",
+  "name":"private-vault","version":"0.3.1","description":"私密密码库：文件恢复、自建同步与可选 Chrome 填写",
   "private":true,"license":"MIT","type":"module","main":"windows/main.cjs",
   "scripts":{"configure":"node tools/server-config.mjs","start":"electron .","test":"node tools/test.mjs","build:windows":"node tools/build-windows.mjs","build:android":"powershell -NoProfile -ExecutionPolicy Bypass -File tools/build-android.ps1"},
   "devDependencies":{"electron":"44.7.0","electron-builder":"26.15.3"},
